@@ -319,3 +319,36 @@ function showMessageText(message, isError = false) {
         `min-h-5 text-center text-xs ${isError ? "text-rose-400" : "text-slate-400"
         }`;
 }
+
+
+async function diagnoseUsbCamera() {
+    try {
+        // Request camera permission first
+        const stream = await navigator.mediaDevices.getUserMedia({
+            video: true
+        });
+
+        // Now enumerate all available cameras
+        const devices = await navigator.mediaDevices.enumerateDevices();
+
+        const cameras = devices
+            .filter(device => device.kind === "videoinput")
+            .map(device => ({
+                label: device.label,
+                deviceId: device.deviceId
+            }));
+
+        console.log("Detected cameras:", cameras);
+
+        alert(JSON.stringify(cameras, null, 2));
+
+        // Release temporary camera
+        stream.getTracks().forEach(track => track.stop());
+
+    } catch (error) {
+        console.error("Camera diagnostic failed:", error);
+        alert(error.message);
+    }
+}
+
+diagnoseUsbCamera();
