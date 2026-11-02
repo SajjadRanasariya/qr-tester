@@ -1,154 +1,256 @@
 
-let qrScanner;
-let cameras = [];
+/*
+ * QR Scanner
+ * Browser: HTML5 QR Code
+ * Android: AUSBC native camera bridge
+ */
+
+let html5QrCode = null;
+let browserCameras = [];
 let selectedCameraId = "";
 let selectedMode = "back";
-let isScanning = false;
+let scannerRunning = false;
+let scannerMode = "browser";
+
 let lastDecodedText = "";
 let lastDecodedAt = 0;
 
 const $ = (id) => document.getElementById(id);
 
+function hasAndroidBridge() {
+    return typeof window.AndroidUsbCamera !== "undefined";
+}
+
 document.addEventListener("DOMContentLoaded", async () => {
-    qrScanner = new Html5Qrcode("reader");
+
+    if (typeof Html5Qrcode !== "undefined") {
+        html5QrCode = new Html5Qrcode("reader");
+    }
 
     $("start-scanner").addEventListener("click", startScanner);
     $("stop-scanner").addEventListener("click", stopScanner);
     $("refresh-cameras").addEventListener("click", refreshCameras);
     $("copy-result").addEventListener("click", copyResult);
+    $("btn-usb-camera").addEventListener("click", selectUsbMode);
 
     $("camera-select").addEventListener("change", async (event) => {
+
         selectedCameraId = event.target.value;
-        const camera = cameras.find(c => c.id === selectedCameraId);
 
-        if (camera) {
-            selectedMode = inferMode(camera.label || "");
-            updateModeButtons();
+        const camera = browserCameras.find(
+            c => c.id === selectedCameraId
+        );
+
+        selectedMode = inferCameraMode(camera?.label || "");
+
+        updateModeButtons();
+
+        if (scannerRunning && scannerMode === "browser") {
+            await restartBrowserScanner();
         }
-
-        if (isScanning) await restartScanner();
     });
 
     document.querySelectorAll(".camera-choice").forEach(button => {
         button.addEventListener("click", () => {
-            chooseMode(button.dataset.mode);
+            selectBrowserMode(button.dataset.mode);
         });
     });
 
+    // Android sends QR results here.
+    window.onNativeQrScanned = function (decodedText) {
+
+        if (!decodedText) return;
+
+        displayScanResult(
+            decodedText,
+            "USB OTG Camera"
+        );
+    };
+
+    // Android camera status callback.
+    window.onNativeCameraStatus = function (status, message = "") {
+
+        status = String(status).toLowerCase();
+
+        if (status === "started" || status === "scanning") {
+
+            scannerRunning = true;
+            scannerMode = "native";
+
+            setRunningUI(true, "USB camera scanning");
+
+            $("camera-placeholder").classList.add("hidden");
+
+            $("native-preview-placeholder").classList.remove("hidden");
+            $("native-preview-placeholder").classList.add("flex");
+
+        } else if (
+            status === "stopped" ||
+            status === "disconnected" ||
+            status === "error"
+        ) {
+
+            scannerRunning = false;
+
+            setRunningUI(false, "Stopped");
+
+            $("camera-placeholder").classList.remove("hidden");
+
+            $("native-preview-placeholder").classList.add("hidden");
+            $("native-preview-placeholder").classList.remove("flex");
+        }
+
+        if (message) {
+            showMessage(message, status === "error");
+        }
+    };
+
     await refreshCameras(false);
+
+    if (hasAndroidBridge()) {
+        $("camera-help").textContent =
+            "Android companion app detected. USB OTG is available.";
+    }
 });
 
-async function refreshCameras(showMessage = true) {
-    $("camera-status").textContent = "Detecting cameras...";
 
-    try {
-        cameras = await Html5Qrcode.getCameras();
-        renderCameraOptions();
+// ========================================
+// CAMERA DETECTION
+// ========================================
 
-        if (!cameras.length) {
-            $("camera-status").textContent = "No cameras found.";
-            return;
-        }
+async function refreshCameras(showNotice = true) {
 
-        if (!selectedCameraId ||
-            !cameras.some(c => c.id === selectedCameraId)) {
-            const preferred = findCamera(selectedMode);
-            selectedCameraId = preferred?.id || cameras[0].id;
-        }
-
-        $("camera-select").value = selectedCameraId;
-
-        const selected = cameras.find(c => c.id === selectedCameraId);
-
-        $("camera-status").textContent =
-            `${cameras.length} camera(s) detected` +
-            (selected?.label ? ` · Selected: ${selected.label}` : "");
-
-        if (showMessage) showMessageText("Camera list refreshed.");
-
-    } catch (error) {
-        $("camera-status").textContent =
-            "Allow camera permission when starting the scanner.";
-
-        if (showMessage) showMessageText(getErrorMessage(error), true);
-    }
-}
-
-function renderCameraOptions() {
     const select = $("camera-select");
-    select.replaceChildren();
 
-    if (!cameras.length) {
-        select.add(new Option("No cameras detected", ""));
+    $("camera-count").textContent = "Detecting...";
+
+    if (!navigator.mediaDevices?.enumerateDevices) {
+
+        $("camera-count").textContent = "Unavailable";
+
+        select.replaceChildren(
+            new Option("Browser camera API unavailable", "")
+        );
+
         return;
     }
 
-    cameras.forEach((camera, index) => {
-        select.add(new Option(
-            camera.label || `Camera ${index + 1}`,
-            camera.id
-        ));
+    try {
+
+        const devices =
+            await navigator.mediaDevices.enumerateDevices();
+
+        browserCameras = devices
+            .filter(device => device.kind === "videoinput")
+            .map(device => ({
+                id: device.deviceId,
+                label: device.label
+            }));
+
+        renderBrowserCameraOptions();
+
+        if (
+            !selectedCameraId ||
+            !browserCameras.some(c => c.id === selectedCameraId)
+        ) {
+
+            const preferred = findBrowserCamera(selectedMode);
+
+            selectedCameraId =
+                preferred?.id || browserCameras[0]?.id || "";
+        }
+
+        select.value = selectedCameraId;
+
+        $("camera-count").textContent =
+            `${browserCameras.length} browser camera(s)`;
+
+        if (showNotice) {
+            showMessage("Camera list refreshed.");
+        }
+
+    } catch (error) {
+
+        $("camera-count").textContent = "Detection failed";
+
+        showMessage(error.message, true);
+    }
+}
+
+
+function renderBrowserCameraOptions() {
+
+    const select = $("camera-select");
+
+    select.replaceChildren();
+
+    if (!browserCameras.length) {
+
+        select.add(
+            new Option("No browser cameras detected", "")
+        );
+
+        return;
+    }
+
+    browserCameras.forEach((camera, index) => {
+
+        select.add(
+            new Option(
+                camera.label || `Camera ${index + 1}`,
+                camera.id
+            )
+        );
     });
 }
 
-function inferMode(label) {
-    const value = label.toLowerCase();
 
-    if (/back|rear|environment/.test(value)) return "back";
-    if (/front|user|selfie|facetime/.test(value)) return "front";
+function inferCameraMode(label) {
+
+    if (/back|rear|environment/i.test(label)) {
+        return "back";
+    }
+
+    if (/front|user|selfie|facetime/i.test(label)) {
+        return "front";
+    }
 
     return "webcam";
 }
 
-function findCamera(mode) {
+
+function findBrowserCamera(mode) {
+
     if (mode === "back") {
-        return cameras.find(c =>
-            /back|rear|environment/i.test(c.label || "")
+        return browserCameras.find(c =>
+            /back|rear|environment/i.test(c.label)
         );
     }
 
     if (mode === "front") {
-        return cameras.find(c =>
-            /front|user|selfie|facetime/i.test(c.label || "")
+        return browserCameras.find(c =>
+            /front|user|selfie|facetime/i.test(c.label)
         );
     }
 
-    return cameras.find(c =>
-        /webcam|usb|integrated/i.test(c.label || "")
-    );
-}
-
-async function chooseMode(mode) {
-    selectedMode = mode;
-    const matched = findCamera(mode);
-
-    if (matched) {
-        selectedCameraId = matched.id;
-        $("camera-select").value = matched.id;
-
-        $("camera-status").textContent =
-            `Selected: ${matched.label || "Camera device"}`;
-
-    } else if (mode === "webcam") {
-        showMessageText(
-            "No webcam identified. Select a device from the list.",
-            true
+    if (mode === "webcam") {
+        return browserCameras.find(c =>
+            /webcam|usb|integrated/i.test(c.label)
         );
-        return;
-    } else {
-        selectedCameraId = "";
-
-        $("camera-status").textContent =
-            `Will request the ${mode === "back" ? "rear" : "front"} camera.`;
     }
 
-    updateModeButtons();
-
-    if (isScanning) await restartScanner();
+    return null;
 }
+
+
+// ========================================
+// CAMERA SELECTION
+// ========================================
 
 function updateModeButtons() {
+
     document.querySelectorAll(".camera-choice").forEach(button => {
+
         button.setAttribute(
             "aria-pressed",
             String(button.dataset.mode === selectedMode)
@@ -156,199 +258,399 @@ function updateModeButtons() {
     });
 }
 
-async function startScanner() {
-    if (isScanning) return;
 
-    setControls(true);
+async function selectBrowserMode(mode) {
+
+    if (!html5QrCode) {
+        showMessage("QR scanner library unavailable.", true);
+        return;
+    }
+
+    selectedMode = mode;
+    scannerMode = "browser";
+
+    const camera = findBrowserCamera(mode);
+
+    selectedCameraId = camera?.id || "";
+
+    if (selectedCameraId) {
+        $("camera-select").value = selectedCameraId;
+    }
+
+    updateModeButtons();
+
+    $("native-preview-placeholder").classList.add("hidden");
+    $("native-preview-placeholder").classList.remove("flex");
+
+    if (scannerRunning && scannerMode === "browser") {
+        await restartBrowserScanner();
+    }
+}
+
+
+// ========================================
+// USB OTG CAMERA
+// ========================================
+
+function selectUsbMode() {
+
+    selectedMode = "usb";
+    scannerMode = "native";
+
+    updateModeButtons();
+
+    $("camera-help").textContent =
+        "USB OTG requires the Android companion application.";
+
+    if (!hasAndroidBridge()) {
+
+        showMessage(
+            "USB OTG is available only inside the Android companion app.",
+            true
+        );
+
+        return;
+    }
+
     $("camera-placeholder").classList.add("hidden");
 
+    $("native-preview-placeholder").classList.remove("hidden");
+    $("native-preview-placeholder").classList.add("flex");
+
+    showMessage("Requesting USB camera...");
+
     try {
-        const cameraConfig = selectedCameraId || {
-            facingMode: selectedMode === "front"
+
+        window.AndroidUsbCamera.startUsbScanner();
+
+    } catch (error) {
+
+        showMessage(
+            "USB camera error: " + error.message,
+            true
+        );
+    }
+}
+
+
+// ========================================
+// START SCANNER
+// ========================================
+
+async function startScanner() {
+
+    if (scannerRunning) return;
+
+    if (selectedMode === "usb" || scannerMode === "native") {
+
+        if (!hasAndroidBridge()) {
+
+            showMessage(
+                "Open this website inside the Android companion app.",
+                true
+            );
+
+            return;
+        }
+
+        try {
+
+            window.AndroidUsbCamera.startUsbScanner();
+
+            showMessage("Starting USB camera...");
+
+        } catch (error) {
+
+            showMessage(error.message, true);
+        }
+
+        return;
+    }
+
+    await startBrowserScanner();
+}
+
+
+async function startBrowserScanner() {
+
+    if (!html5QrCode) {
+
+        showMessage(
+            "HTML5 QR library not loaded.",
+            true
+        );
+
+        return;
+    }
+
+    scannerMode = "browser";
+
+    $("camera-placeholder").classList.add("hidden");
+
+    setRunningUI(false, "Starting...");
+
+    const cameraConfig = selectedCameraId || {
+        facingMode:
+            selectedMode === "front"
                 ? "user"
                 : "environment"
-        };
+    };
 
-        await qrScanner.start(
+    try {
+
+        await html5QrCode.start(
+
             cameraConfig,
+
             {
                 fps: 10,
+
+                // QR scanning square size: 50%
                 qrbox: (width, height) => {
+
                     const size = Math.floor(
                         Math.min(width, height) * 0.50
                     );
 
                     return {
-                        width: Math.max(180, size),
-                        height: Math.max(180, size)
+                        width: size,
+                        height: size
                     };
                 },
+
                 aspectRatio: 1
             },
-            handleScan,
+
+            (decodedText) => {
+
+                displayScanResult(
+                    decodedText,
+                    getSelectedCameraLabel()
+                );
+
+            },
+
             () => { }
+
         );
 
-        isScanning = true;
-        setControls(false);
+        scannerRunning = true;
 
-        $("scan-status").lastChild.textContent = " Scanning";
-        $("status-dot").className =
-            "h-2 w-2 rounded-full bg-emerald-400";
+        setRunningUI(true, "Scanning");
 
-        $("camera-status").textContent =
-            "Camera active. Point it at a QR code.";
+        showMessage(
+            "Camera active. Point it at a QR code."
+        );
 
         await refreshCameras(false);
 
     } catch (error) {
-        isScanning = false;
-        setControls(false);
+
+        scannerRunning = false;
+
+        setRunningUI(false, "Stopped");
 
         $("camera-placeholder").classList.remove("hidden");
 
-        $("scan-status").lastChild.textContent = " Stopped";
-        $("status-dot").className =
-            "h-2 w-2 rounded-full bg-slate-500";
-
-        showMessageText(getErrorMessage(error), true);
+        showMessage(getCameraError(error), true);
     }
 }
+
+
+// ========================================
+// STOP SCANNER
+// ========================================
 
 async function stopScanner() {
-    if (!isScanning) return;
 
-    try {
-        await qrScanner.stop();
-    } catch (error) {
-        console.warn("Stop error:", error);
-    }
+    if (scannerMode === "native" || selectedMode === "usb") {
 
-    isScanning = false;
-    setControls(false);
+        if (hasAndroidBridge()) {
 
-    $("camera-placeholder").classList.remove("hidden");
+            try {
 
-    $("scan-status").lastChild.textContent = " Stopped";
-    $("status-dot").className =
-        "h-2 w-2 rounded-full bg-slate-500";
+                window.AndroidUsbCamera.stopUsbScanner();
 
-    $("camera-status").textContent = "Camera stopped.";
-}
+            } catch (error) {
 
-async function restartScanner() {
-    if (isScanning) {
-        try {
-            await qrScanner.stop();
-        } catch (error) {
-            console.warn(error);
+                showMessage(error.message, true);
+            }
         }
 
-        isScanning = false;
+        scannerRunning = false;
+
+        setRunningUI(false, "Stopped");
+
+        $("camera-placeholder").classList.remove("hidden");
+
+        $("native-preview-placeholder").classList.add("hidden");
+        $("native-preview-placeholder").classList.remove("flex");
+
+        return;
     }
 
-    await startScanner();
+    await stopBrowserScanner();
 }
 
-function handleScan(decodedText) {
+
+async function stopBrowserScanner() {
+
+    if (html5QrCode && scannerRunning) {
+
+        try {
+
+            await html5QrCode.stop();
+
+        } catch (error) {
+
+            console.warn(error);
+        }
+    }
+
+    scannerRunning = false;
+
+    setRunningUI(false, "Stopped");
+
+    $("camera-placeholder").classList.remove("hidden");
+}
+
+
+async function restartBrowserScanner() {
+
+    await stopBrowserScanner();
+
+    await startBrowserScanner();
+}
+
+
+// ========================================
+// QR SCAN RESULT
+// ========================================
+
+function displayScanResult(decodedText, source) {
+
     const now = Date.now();
 
-    // Prevent repeated duplicate results.
+    // Avoid duplicate scan callbacks.
     if (
         decodedText === lastDecodedText &&
         now - lastDecodedAt < 1500
-    ) return;
+    ) {
+        return;
+    }
 
     lastDecodedText = decodedText;
     lastDecodedAt = now;
 
     $("decoded-data").textContent = decodedText;
+
     $("result-hint").textContent =
         "QR code scanned successfully.";
 
-    $("result-meta").textContent =
-        `Scanned at ${new Date().toLocaleTimeString()}`;
+    $("result-source").textContent =
+        "Source: " + source;
+
+    $("result-time").textContent =
+        "Time: " + new Date().toLocaleTimeString();
 
     $("copy-result").disabled = false;
 
-    $("status-dot").className =
-        "h-2 w-2 rounded-full bg-emerald-400";
-
-    showMessageText("QR code scanned successfully.");
+    showMessage("QR code scanned successfully.");
 }
 
-async function copyResult() {
-    const text = $("decoded-data").textContent;
 
-    if (!text || text === "Waiting for QR scan...") return;
+// ========================================
+// COPY DATA
+// ========================================
+
+async function copyResult() {
+
+    const value = $("decoded-data").textContent;
+
+    if (
+        !value ||
+        value.startsWith("Waiting for QR scan")
+    ) {
+        return;
+    }
 
     try {
-        await navigator.clipboard.writeText(text);
-        showMessageText("Scanned data copied.");
+
+        await navigator.clipboard.writeText(value);
+
+        showMessage("Scanned data copied.");
+
     } catch {
-        showMessageText(
+
+        showMessage(
             "Clipboard access failed. Copy manually.",
             true
         );
     }
 }
 
-function setControls(starting) {
-    $("start-scanner").disabled = starting || isScanning;
-    $("stop-scanner").disabled = starting || !isScanning;
+
+// ========================================
+// UI HELPERS
+// ========================================
+
+function getSelectedCameraLabel() {
+
+    const camera = browserCameras.find(
+        c => c.id === selectedCameraId
+    );
+
+    return camera?.label ||
+        (selectedMode === "front"
+            ? "Phone front camera"
+            : "Phone back camera / webcam");
 }
 
-function getErrorMessage(error) {
-    const message = String(error?.message || error || "");
+
+function setRunningUI(running, statusText) {
+
+    $("start-scanner").disabled = running;
+
+    $("stop-scanner").disabled = !running;
+
+    $("scan-status").textContent = statusText;
+
+    $("status-dot").className = running
+        ? "h-2 w-2 rounded-full bg-emerald-400"
+        : "h-2 w-2 rounded-full bg-slate-500";
+}
+
+
+function getCameraError(error) {
+
+    const message = String(
+        error?.message || error || ""
+    );
 
     if (/permission|denied|notallowed/i.test(message)) {
-        return "Camera permission denied. Allow camera access in browser settings.";
+
+        return "Camera permission denied. Allow camera access.";
     }
 
-    if (/notfound|no camera|device/i.test(message)) {
-        return "Camera not found. Connect a camera or select another.";
+    if (/notfound|no camera/i.test(message)) {
+
+        return "Camera not found. Select another camera.";
     }
 
-    return `Could not start camera: ${message}`;
-}
+    if (/secure|https/i.test(message)) {
 
-function showMessageText(message, isError = false) {
-    $("message").textContent = message;
-
-    $("message").className =
-        `min-h-5 text-center text-xs ${isError ? "text-rose-400" : "text-slate-400"
-        }`;
-}
-
-
-async function diagnoseUsbCamera() {
-    try {
-        // Request camera permission first
-        const stream = await navigator.mediaDevices.getUserMedia({
-            video: true
-        });
-
-        // Now enumerate all available cameras
-        const devices = await navigator.mediaDevices.enumerateDevices();
-
-        const cameras = devices
-            .filter(device => device.kind === "videoinput")
-            .map(device => ({
-                label: device.label,
-                deviceId: device.deviceId
-            }));
-
-        console.log("Detected cameras:", cameras);
-
-        alert(JSON.stringify(cameras, null, 2));
-
-        // Release temporary camera
-        stream.getTracks().forEach(track => track.stop());
-
-    } catch (error) {
-        console.error("Camera diagnostic failed:", error);
-        alert(error.message);
+        return "Camera access requires HTTPS or localhost.";
     }
+
+    return "Could not start camera: " + message;
 }
 
-diagnoseUsbCamera();
+
+function showMessage(message, isError = false) {
+
+    $("scanner-message").textContent = message;
+
+    $("scanner-message").className =
+        "mt-3 min-h-5 text-center text-xs " +
+        (isError ? "text-rose-400" : "text-slate-400");
+}
